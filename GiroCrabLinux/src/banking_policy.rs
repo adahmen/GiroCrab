@@ -390,6 +390,7 @@ pub fn display_name(id: &str) -> String {
         "fnz" => "FNZ Bank",
         "ibkr" => "Interactive Brokers",
         "quirion" => "quirion",
+        "unioninvestment" => "Union Investment",
         "uberspace" => "Uberspace",
         "schwaebischhall" => "Schwäbisch Hall",
         "fin4u" => "Alte Leipziger",
