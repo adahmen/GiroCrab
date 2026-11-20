@@ -3,6 +3,8 @@
 //! The portal is the only interface (no FinTS/PSD2), see `docs/unioninvestment-connector.md`.
 use std::{collections::HashSet, sync::Arc};
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use rusqlite::{params, OptionalExtension};
 use serde_json::Value;
 
 use super::{FetchResult, RemoteAccount, RemoteHolding, SyncSummary};
@@ -194,6 +196,145 @@ impl Vault {
     }
 }
 
+impl Vault {
+    fn check_unioninvestment(&self, connection_id: i64) -> CoreResult<()> {
+        if self.portal_connection(connection_id)?.0 != ConnectorKind::UnionInvestment {
+            return Err(invalid());
+        }
+        crate::banking_gate::check_connector("unioninvestment")
+    }
+}
+
+/// Stable per connection and mailbox document; no session state is part of it.
+fn document_source(connection_id: i64, key: &str) -> String {
+    format!(
+        "unioninvestment:{connection_id}:{}",
+        URL_SAFE_NO_PAD.encode(key)
+    )
+}
+
+/// The page script identifies a mailbox document by depot number (or, for letters to the
+/// depot owner that belong to no depot, the owner index), message id and attachment
+/// number; all of them must be plain digits.
+///
+/// On failure the error names the field, never its content.
+fn document_key(doc: &Value) -> Result<String, &'static str> {
+    let digits = |key: &'static str| -> Result<String, &'static str> {
+        match doc[key].as_str() {
+            Some(s) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => Ok(s.into()),
+            _ => Err(key),
+        }
+    };
+    let scope = if doc.get("depotNumber").is_some() {
+        digits("depotNumber")?
+    } else {
+        format!("owner{}", digits("ownerIndex")?)
+    };
+    Ok(format!(
+        "{scope}:{}:{}",
+        digits("id")?,
+        digits("attachmentId")?
+    ))
+}
+
+/// A mailbox entry the core rejects: which entry (1-based) and which field, no content.
+fn document_error(index: usize, field: &str) -> CoreError {
+    CoreError::InvalidInput {
+        message: crate::i18n::trf(
+            "Union Investment: Postbox-Eintrag {0} abgelehnt, Feld {1} ungültig.",
+            &[&(index + 1), &field],
+        ),
+    }
+}
+
+#[uniffi::export]
+impl Vault {
+    /// Only returns unknown mailbox documents; a PDF is stored once per
+    /// connection, message and attachment.
+    pub fn pending_unioninvestment_documents(
+        self: Arc<Self>,
+        connection_id: i64,
+        documents_json: String,
+    ) -> CoreResult<Vec<String>> {
+        self.check_unioninvestment(connection_id)?;
+        // document retrieval switched off for this connection: nothing to download
+        if !super::documents_fetch_on(&*self.db()?, connection_id)? {
+            return Ok(Vec::new());
+        }
+        let docs: Vec<Value> = serde_json::from_str(&documents_json).map_err(|_| invalid())?;
+        let db = self.db()?;
+        let mut seen = HashSet::new();
+        let mut pending = Vec::new();
+        for (index, doc) in docs.into_iter().enumerate() {
+            let key = document_key(&doc).map_err(|f| document_error(index, f))?;
+            date(&doc, "sentDate").map_err(|_| document_error(index, "sentDate"))?;
+            if seen.insert(key.clone())
+                && !db.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM booking_documents WHERE source_url=?1)",
+                    [document_source(connection_id, &key)],
+                    |r| r.get::<_, bool>(0),
+                )?
+            {
+                pending.push(doc.to_string());
+            }
+        }
+        Ok(pending)
+    }
+
+    /// Stores one mailbox PDF at the securities account of its depot.
+    pub fn import_unioninvestment_document(
+        self: Arc<Self>,
+        connection_id: i64,
+        document_json: String,
+        bytes: Vec<u8>,
+    ) -> CoreResult<bool> {
+        self.check_unioninvestment(connection_id)?;
+        if !bytes.starts_with(b"%PDF-") {
+            return Err(invalid());
+        }
+        let doc: Value = serde_json::from_str(&document_json).map_err(|_| invalid())?;
+        let key = document_key(&doc).map_err(|_| invalid())?;
+        let sent = date(&doc, "sentDate")?;
+        // some messages carry no subject; they are still documents
+        let title = doc["subject"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Postbox-Nachricht");
+        let db = self.db()?;
+        // A document of a depot goes to that depot. A letter to the depot owner belongs to no
+        // depot: it is attached to the connection's first securities account.
+        let account_id: i64 = if doc.get("depotNumber").is_some() {
+            db.query_row(
+                "SELECT id FROM accounts WHERE connection_id=?1 AND deleted_ms IS NULL AND external_ref=?2",
+                params![connection_id, format!("depot:{}", text(&doc, "depotNumber")?)],
+                |r| r.get(0),
+            )
+        } else {
+            db.query_row(
+                "SELECT id FROM accounts WHERE connection_id=?1 AND deleted_ms IS NULL AND external_ref LIKE 'depot:%' ORDER BY id LIMIT 1",
+                params![connection_id],
+                |r| r.get(0),
+            )
+        }
+        .optional()?
+        .ok_or_else(invalid)?;
+        Ok(crate::documents::insert_doc(
+            &db,
+            None,
+            Some(account_id),
+            title,
+            "postbox",
+            "application/pdf",
+            &format!("unioninvestment_{}.pdf", URL_SAFE_NO_PAD.encode(&key)),
+            &bytes,
+            &document_source(connection_id, &key),
+            &sent,
+        )?
+        .is_some())
+    }
+}
+
 pub struct WebOnlyConnector;
 
 #[async_trait::async_trait]
@@ -317,6 +458,189 @@ mod tests {
         assert!(vault
             .clone()
             .import_unioninvestment_snapshot(id, fixture().to_string())
+            .is_err());
+    }
+
+    fn mailbox_doc(id: &str) -> Value {
+        json!({"depotNumber":"123456789","id":id,"attachmentId":"1",
+            "sentDate":"2026-10-01T08:30:00","subject":"Quartalsauszug 3. Quartal 2026"})
+    }
+
+    fn vault_with_depot(name: &str) -> (crate::test_support::TempDir, Arc<Vault>, i64) {
+        let dir = crate::test_support::TempDir::new(name);
+        let vault =
+            Vault::open(dir.join("vault.db").to_string_lossy().into(), vec![7; 32]).unwrap();
+        let connection = vault
+            .add_bank_connection(
+                ConnectorKind::UnionInvestment,
+                "Test Union".into(),
+                "test".into(),
+            )
+            .unwrap();
+        vault
+            .clone()
+            .import_unioninvestment_snapshot(connection, fixture().to_string())
+            .unwrap();
+        (dir, vault, connection)
+    }
+
+    #[test]
+    fn mailbox_documents_are_stored_once_at_the_depot() {
+        let (_dir, vault, connection) = vault_with_depot("unioninvestment-docs");
+        let doc = mailbox_doc("1000000001").to_string();
+        let list = format!("[{doc},{doc}]");
+        let pending = |list: &str| {
+            vault
+                .clone()
+                .pending_unioninvestment_documents(connection, list.into())
+                .unwrap()
+        };
+        // the same document twice in one list is reported once
+        assert_eq!(pending(&list).len(), 1);
+        assert!(vault
+            .clone()
+            .import_unioninvestment_document(
+                connection,
+                doc.clone(),
+                b"<html>login</html>".to_vec()
+            )
+            .is_err());
+        assert!(vault
+            .clone()
+            .import_unioninvestment_document(
+                connection,
+                doc.clone(),
+                b"%PDF-1.7 synthetic".to_vec()
+            )
+            .unwrap());
+        // a second import and a second sync add nothing
+        assert!(!vault
+            .clone()
+            .import_unioninvestment_document(connection, doc, b"%PDF-1.7 synthetic".to_vec())
+            .unwrap());
+        assert!(pending(&list).is_empty());
+        // another message of the same depot is new
+        assert_eq!(
+            pending(&format!("[{}]", mailbox_doc("1000000002"))).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_message_without_subject_is_still_a_document() {
+        let (_dir, vault, connection) = vault_with_depot("unioninvestment-docs-subject");
+        for subject in [json!(""), json!("   "), json!(null)] {
+            let mut doc = mailbox_doc("1000000042");
+            doc["subject"] = subject;
+            let doc = doc.to_string();
+            assert_eq!(
+                vault
+                    .clone()
+                    .pending_unioninvestment_documents(connection, format!("[{doc}]"))
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        let mut doc = mailbox_doc("1000000042");
+        doc.as_object_mut().unwrap().remove("subject");
+        assert!(vault
+            .clone()
+            .import_unioninvestment_document(
+                connection,
+                doc.to_string(),
+                b"%PDF-1.7 synthetic".to_vec()
+            )
+            .unwrap());
+        let stored = vault
+            .list_all_documents(crate::documents::DocumentFilter::default())
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].title, "Postbox-Nachricht");
+    }
+
+    #[test]
+    fn letters_to_the_depot_owner_attach_to_the_depot_and_are_deduplicated() {
+        let (_dir, vault, connection) = vault_with_depot("unioninvestment-docs-owner");
+        let letter = json!({"ownerIndex":"1","id":"2000000001","attachmentId":"1",
+            "sentDate":"2026-01-05T00:00:00","subject":"Mitteilung"})
+        .to_string();
+        let pending = |l: &str| {
+            vault
+                .clone()
+                .pending_unioninvestment_documents(connection, format!("[{l}]"))
+                .unwrap()
+        };
+        assert_eq!(pending(&letter).len(), 1);
+        assert!(vault
+            .clone()
+            .import_unioninvestment_document(
+                connection,
+                letter.clone(),
+                b"%PDF-1.7 synthetic".to_vec()
+            )
+            .unwrap());
+        assert!(pending(&letter).is_empty());
+        // a depot document with the same message number is a different document
+        let mut same_id = mailbox_doc("2000000001");
+        same_id["attachmentId"] = json!("1");
+        assert_eq!(pending(&same_id.to_string()).len(), 1);
+        // neither key may be missing
+        let none = json!({"id":"1","attachmentId":"1","sentDate":"2026-01-05","subject":"x"});
+        assert!(vault
+            .clone()
+            .pending_unioninvestment_documents(connection, json!([none]).to_string())
+            .is_err());
+    }
+
+    #[test]
+    fn mailbox_documents_reject_bad_keys_unknown_depots_and_other_connections() {
+        let (_dir, vault, connection) = vault_with_depot("unioninvestment-docs-bad");
+        let bad = |doc: Value| {
+            assert!(
+                vault
+                    .clone()
+                    .pending_unioninvestment_documents(connection, json!([doc]).to_string())
+                    .is_err(),
+                "pending"
+            )
+        };
+        let mut d = mailbox_doc("1");
+        d["id"] = json!("../1");
+        bad(d);
+        let mut d = mailbox_doc("1");
+        d["depotNumber"] = json!("12 3");
+        bad(d);
+        let mut d = mailbox_doc("1");
+        d["sentDate"] = json!("gestern");
+        bad(d);
+        // the error names the entry and the field, never the content
+        let mut d = mailbox_doc("1");
+        d["id"] = json!("12 secret");
+        let err = vault
+            .clone()
+            .pending_unioninvestment_documents(connection, json!([mailbox_doc("2"), d]).to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2") && err.contains("id"), "{err}");
+        assert!(!err.contains("secret"), "{err}");
+        // a depot this connection never imported cannot take the document
+        let mut other_depot = mailbox_doc("1000000003");
+        other_depot["depotNumber"] = json!("999999999");
+        assert!(vault
+            .clone()
+            .import_unioninvestment_document(
+                connection,
+                other_depot.to_string(),
+                b"%PDF-1.7 synthetic".to_vec()
+            )
+            .is_err());
+        let wrong = vault
+            .add_bank_connection(ConnectorKind::PayPal, "Other".into(), "test".into())
+            .unwrap();
+        assert!(vault
+            .clone()
+            .pending_unioninvestment_documents(wrong, "[]".into())
             .is_err());
     }
 }

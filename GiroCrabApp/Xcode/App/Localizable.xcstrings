@@ -24311,6 +24311,17 @@
         }
       }
     },
+    "PDF-Postbox abrufen" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fetch PDF mailbox"
+          }
+        }
+      }
+    },
     "PDF-Postbox inkl. Archiv" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -25028,6 +25039,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Postbank: use the Postbank ID as user name, not the account number."
+          }
+        }
+      }
+    },
+    "Postbox auflisten …" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Listing mailbox …"
           }
         }
       }
@@ -29759,13 +29781,13 @@
         }
       }
     },
-    "Union Investment: %u Depots aktualisiert." : {
+    "Union Investment: %u Depots aktualisiert, %lld neue PDFs." : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Union Investment: %u depots updated."
+            "value" : "Union Investment: %u depots updated, %lld new PDFs."
           }
         }
       }

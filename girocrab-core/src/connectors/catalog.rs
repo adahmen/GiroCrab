@@ -133,7 +133,7 @@ pub fn descriptor(kind: ConnectorKind) -> BankDescriptor {
             login_label: tr("Zugangsbezeichnung").into(),
             secret_label: tr("(Anmeldung im Browser-Fenster)").into(),
             required_settings: vec![],
-            note: tr("Union Investment (UnionDepot): Depotwert und Fondspositionen. Anmeldung im Browserfenster mit SMS-TAN. Interne Portal-Schnittstelle; Änderungen sind möglich.").into(),
+            note: tr("Union Investment (UnionDepot): Depotwert, Fondspositionen und PDF-Postbox. Anmeldung im Browserfenster mit SMS-TAN. Interne Portal-Schnittstelle; Änderungen sind möglich.").into(),
         },
         ConnectorKind::Easybank => BankDescriptor {
             kind,
@@ -733,7 +733,11 @@ pub const BANK_MATRIX: &[MatrixEntry] = &[
         kind: Some(ConnectorKind::UnionInvestment),
         interface: Interface::WebPortal,
         official: Some(false),
-        capabilities: &[Capability::Balances, Capability::Securities],
+        capabilities: &[
+            Capability::Balances,
+            Capability::Securities,
+            Capability::Documents,
+        ],
         status: Status::TestingWanted,
         issues: &[],
     },
